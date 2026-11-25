@@ -23,6 +23,8 @@ Las grabaciones se guardan por defecto en `recordings` dentro del proyecto. Para
 
 FFmpeg guarda el video y el audio en un archivo MKV, codificando el audio como AAC para mejorar la compatibilidad con reproductores. MyRecorder prefiere formatos muxed de YouTube, que llevan audio y video en el mismo stream; usa streams separados solo si no hay un formato muxed disponible. Al finalizar una captura, crea una portada JPG a partir de un fotograma del video. Las grabaciones finalizadas y su estado se guardan localmente.
 
+Durante la captura, MyRecorder guarda partes MKV internas. Pausar cierra la parte activa; reanudar resuelve de nuevo el directo y comienza otra parte. Si FFmpeg se interrumpe inesperadamente y el directo sigue activo, MyRecorder intenta reconectar hasta tres veces. Al detener o finalizar la captura, une las partes en un único MKV para la galería.
+
 ### Diagnosticar una grabación sin audio
 
 Cada carpeta de grabación contiene:

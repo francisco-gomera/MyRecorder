@@ -26,6 +26,8 @@ OUTPUT.mkdir(parents=True, exist_ok=True)
 LOCK = threading.RLock()
 PROCESSES: dict[str, subprocess.Popen] = {}
 STOPPING: set[str] = set()
+PAUSING: set[str] = set()
+CONTROL_LOCKS: dict[str, threading.RLock] = {}
 app = FastAPI(title="MyRecorder")
 
 
@@ -61,6 +63,11 @@ def _format_debug(fmt: dict) -> dict:
     """Keep useful format metadata while deliberately excluding expiring URLs."""
     return {key: fmt.get(key) for key in
             ("format_id", "protocol", "vcodec", "acodec", "height", "ext")}
+
+
+def _control_lock(rec_id: str) -> threading.RLock:
+    with LOCK:
+        return CONTROL_LOCKS.setdefault(rec_id, threading.RLock())
 
 
 def _pick_formats(formats: list[dict]) -> dict:
@@ -133,11 +140,16 @@ def _has_audio(path: str | Path) -> bool | None:
 
 def _save_audio_check(rec_id: str, file_path: str | Path) -> bool | None:
     has_audio = _has_audio(file_path)
+    audio_warning = "La grabaci\u00f3n no tiene pista de audio. Revisa ffmpeg.log y formats.txt."
     if has_audio is False:
-        _update(rec_id, has_audio=False,
-                warning="La grabación no tiene pista de audio. Revisa ffmpeg.log y formats.txt.")
+        row = _get(rec_id)
+        existing = str(row.get("warning") or "")
+        warning = existing if audio_warning in existing else " ".join(filter(None, (existing, audio_warning)))
+        _update(rec_id, has_audio=False, warning=warning)
     elif has_audio is True:
-        _update(rec_id, has_audio=True)
+        row = _get(rec_id)
+        existing = str(row.get("warning") or "").replace(audio_warning, "").strip()
+        _update(rec_id, has_audio=True, warning=existing or None)
     return has_audio
 
 
@@ -165,11 +177,17 @@ def _verify_audio_after_start(rec_id: str, file_path: str | Path) -> None:
     delay = max(0, float(started_at) + 20 - time.time())
     if delay:
         time.sleep(delay)
-    _save_audio_check(rec_id, file_path)
+    with LOCK:
+        rows = _read()
+        row = next((item for item in rows if item["id"] == rec_id), None)
+    if row and row.get("status") in {"grabando", "pausada", "reconectando"}:
+        segment_name = row.get("current_segment") or (row.get("segments") or [None])[-1]
+        segment_path = Path(row["folder"]) / segment_name if segment_name else Path(file_path)
+        _save_audio_check(rec_id, segment_path)
 
 
 def _watch_progress(rec_id: str, proc: subprocess.Popen) -> None:
-    """Track capture time and settle recording state when FFmpeg exits."""
+    """Track one segment, then reconnect or finalize when its FFmpeg exits."""
     if proc.stdout is None:
         return
     try:
@@ -201,27 +219,68 @@ def _watch_progress(rec_id: str, proc: subprocess.Popen) -> None:
         return_code = proc.wait()
     except (OSError, subprocess.SubprocessError):
         return_code = proc.poll() if proc.poll() is not None else -1
-    with LOCK:
-        user_stopped = rec_id in STOPPING
-        if user_stopped:
-            STOPPING.discard(rec_id)
-        rows = _read()
-        row = next((item for item in rows if item.get("id") == rec_id), None)
-    if user_stopped or row is None or row.get("status") not in {"grabando", "pausada"}:
-        return
-    media_file = Path(row.get("file", ""))
-    valid_file = media_file.is_file() and media_file.stat().st_size > 1024
-    if return_code == 0 or valid_file:
-        _update(rec_id, status="finalizada", ended_at=time.time(), capture_started_at=None)
-        _save_audio_check(rec_id, media_file)
-        updated = _get(rec_id)
-        cover_path = _make_cover(updated)
-        if cover_path:
-            _update(rec_id, cover_file=cover_path)
-    else:
-        _update(rec_id, status="error", ended_at=time.time(), capture_started_at=None,
-                error=_ffmpeg_error_tail(row.get("folder", "")))
-    PROCESSES.pop(rec_id, None)
+
+    with _control_lock(rec_id):
+        with LOCK:
+            stopping = rec_id in STOPPING
+            pausing = rec_id in PAUSING
+            rows = _read()
+            row = next((item for item in rows if item.get("id") == rec_id), None)
+            if PROCESSES.get(rec_id) is not proc:
+                return
+            if (stopping or pausing or row is None or row.get("status") != "grabando") \
+                    and PROCESSES.get(rec_id) is proc:
+                PROCESSES.pop(rec_id, None)
+        if stopping or pausing or row is None or row.get("status") != "grabando":
+            return
+
+        now = time.time()
+        started = row.get("capture_started_at")
+        elapsed = float(row.get("elapsed_seconds", 0))
+        if started is not None:
+            elapsed = max(elapsed, float(row.get("capture_base_seconds", elapsed)
+                                          + max(0, now - started)))
+        _update(rec_id, elapsed_seconds=elapsed, capture_started_at=None,
+                capture_base_seconds=elapsed, current_segment=None, status="reconectando")
+        last_error = _ffmpeg_error_tail(row.get("folder", ""))
+        normal_end = False
+        for attempt in range(1, 4):
+            with LOCK:
+                if rec_id in STOPPING or rec_id in PAUSING:
+                    return
+            _update(rec_id, reconnect_attempts=attempt)
+            try:
+                resolved = _resolve(row["url"])
+                with LOCK:
+                    if rec_id in STOPPING or rec_id in PAUSING:
+                        return
+                _start_segment(rec_id, resolved)
+                current = _get(rec_id)
+                _update(rec_id, reconnections=int(current.get("reconnections", 0)) + 1,
+                        reconnect_attempts=0)
+                return
+            except Exception as exc:
+                last_error = str(getattr(exc, "detail", exc))[:400]
+                if "no corresponde a un live activo" in last_error.lower():
+                    normal_end = True
+                    break
+                with LOCK:
+                    if rec_id in STOPPING or rec_id in PAUSING:
+                        return
+                if attempt < 3:
+                    time.sleep(attempt)
+        with LOCK:
+            if rec_id in STOPPING or rec_id in PAUSING:
+                return
+        current = _get(rec_id)
+        if current.get("segments"):
+            warning = None if normal_end else f"Se agotaron los 3 intentos de reconexion automatica. {last_error[:250]}"
+            _finish_recording(rec_id, warning=warning)
+        else:
+            _update(rec_id, status="error", ended_at=time.time(), capture_started_at=None,
+                    error=last_error[-400:] or _ffmpeg_error_tail(row.get("folder", "")))
+        if PROCESSES.get(rec_id) is proc:
+            PROCESSES.pop(rec_id, None)
 
 
 def _make_cover(row: dict) -> str | None:
@@ -328,6 +387,121 @@ def _repair_mkv(file_path: str | Path) -> bool:
     return False
 
 
+def _append_format_debug(folder: str | Path, segment: str, resolved: dict) -> None:
+    target = Path(folder) / "formats.txt"
+    try:
+        existing = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        existing = {}
+    entries = existing.get("segments", []) if isinstance(existing, dict) else []
+    entries.append({"segment": segment, "kind": resolved["kind"],
+                    "formats": resolved.get("debug", [])})
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"segments": entries}, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+    os.replace(temporary, target)
+
+
+def _concat_segments(row: dict) -> bool:
+    names = row.get("segments") or []
+    final_file = Path(row["file"])
+    if not names:
+        return final_file.is_file() and final_file.stat().st_size > 1024
+    folder = Path(row["folder"]).resolve()
+    parts = []
+    for name in names:
+        if not isinstance(name, str) or Path(name).name != name:
+            continue
+        part = (folder / name).resolve()
+        if part.parent == folder and part.is_file() and part.stat().st_size > 1024:
+            parts.append(part)
+    if not parts:
+        return final_file.is_file() and final_file.stat().st_size > 1024
+    if len(parts) == 1:
+        if parts[0] != final_file:
+            final_file.unlink(missing_ok=True)
+            os.replace(parts[0], final_file)
+        return final_file.is_file() and final_file.stat().st_size > 1024
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    concat_list = folder / "list.txt"
+    temporary = final_file.with_name(f"{final_file.stem}.joined.mkv")
+    def quote(path: Path) -> str:
+        return path.as_posix().replace("'", "'\\''")
+    concat_list.write_text("".join(f"file '{quote(part)}'\n" for part in parts), encoding="utf-8")
+    try:
+        subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat",
+                        "-safe", "0", "-i", str(concat_list), "-c", "copy", str(temporary)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600, check=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if temporary.is_file() and temporary.stat().st_size > 1024:
+            os.replace(temporary, final_file)
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    temporary.unlink(missing_ok=True)
+    return False
+
+
+def _start_segment(rec_id: str, resolved: dict) -> dict:
+    row = _get(rec_id)
+    folder = Path(row["folder"])
+    segments = list(row.get("segments") or [])
+    number = len(segments) + 1
+    while (folder / f"part{number:02d}.mkv").exists():
+        number += 1
+    segment_name = f"part{number:02d}.mkv"
+    segment_path = folder / segment_name
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("No se encontró FFmpeg.")
+    _append_format_debug(folder, segment_name, resolved)
+    args = _build_ffmpeg_args(resolved, segment_path)
+    args[0] = ffmpeg
+    with (folder / "ffmpeg.log").open("ab") as log_file:
+        log_file.write(f"\n=== {segment_name} ===\n".encode("ascii"))
+        log_file.flush()
+        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log_file,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    segments.append(segment_name)
+    try:
+        updated = _update(rec_id, segments=segments, current_segment=segment_name, pid=proc.pid,
+                          status="grabando", capture_started_at=None,
+                          capture_base_seconds=float(row.get("elapsed_seconds", 0)),
+                          format_kind=resolved["kind"])
+        PROCESSES[rec_id] = proc
+    except Exception:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        raise
+    threading.Thread(target=_watch_progress, args=(rec_id, proc), daemon=True).start()
+    return updated
+
+
+def _finish_recording(rec_id: str, *, warning: str | None = None,
+                      error: str | None = None) -> dict:
+    row = _get(rec_id)
+    merged = _concat_segments(row)
+    if not merged:
+        return _update(rec_id, status="error", ended_at=time.time(), capture_started_at=None,
+                       error=error or "No se pudieron unir las partes de la grabación. Revisa ffmpeg.log.")
+    changes = {"status": "finalizada", "ended_at": time.time(), "capture_started_at": None,
+               "current_segment": None}
+    if warning:
+        changes["warning"] = warning
+    updated = _update(rec_id, **changes)
+    _save_audio_check(rec_id, updated["file"])
+    updated = _get(rec_id)
+    cover_path = _make_cover(updated)
+    if cover_path:
+        updated = _update(rec_id, cover_file=cover_path)
+    return updated
+
+
 class StartRequest(BaseModel):
     url: str
 
@@ -339,33 +513,29 @@ def recordings():
         rows = _read()
         before = json.dumps(rows, ensure_ascii=False, sort_keys=True)
         for row in rows:
-            if row.get("status") != "grabando" or row["id"] in PROCESSES:
+            if row.get("status") not in {"grabando", "reconectando", "deteniendo"} \
+                    or row["id"] in PROCESSES:
                 continue
             try:
                 alive = psutil.Process(int(row["pid"])).is_running()
             except (psutil.Error, KeyError, ValueError):
                 alive = False
             if not alive:
-                media_file = Path(row.get("file", ""))
-                if media_file.is_file() and media_file.stat().st_size > 1024:
-                    row.update(status="finalizada", ended_at=row.get("ended_at") or time.time(),
-                               capture_started_at=None)
-                    completed.append((row["id"], True))
+                folder = Path(row.get("folder", ""))
+                has_parts = any((folder / name).is_file() and (folder / name).stat().st_size > 1024
+                                for name in row.get("segments", []) if Path(name).name == name)
+                final_file = Path(row.get("file", ""))
+                has_final = final_file.is_file() and final_file.stat().st_size > 1024
+                if has_parts or has_final:
+                    row.update(status="deteniendo", ended_at=row.get("ended_at") or time.time())
+                    completed.append(row["id"])
                 else:
                     row.update(status="error", ended_at=row.get("ended_at") or time.time(),
                                capture_started_at=None, error=_ffmpeg_error_tail(row.get("folder", "")))
-                    completed.append((row["id"], False))
         if json.dumps(rows, ensure_ascii=False, sort_keys=True) != before:
             _write(rows)
-    for rec_id, valid in completed:
-        if not valid:
-            continue
-        row = _get(rec_id)
-        _save_audio_check(rec_id, row["file"])
-        row = _get(rec_id)
-        cover_path = _make_cover(row)
-        if cover_path:
-            _update(rec_id, cover_file=cover_path)
+    for rec_id in completed:
+        _finish_recording(rec_id, warning="La aplicacion se reinicio mientras grababa; se guardo el material disponible.")
     with LOCK:
         visible = sorted(_read(), key=lambda x: x.get("created_at", 0), reverse=True)
     return {"recordings": [_clean(row) for row in visible]}
@@ -375,39 +545,31 @@ def recordings():
 def start(body: StartRequest):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise HTTPException(500, "No se encontr\u00f3 FFmpeg. Inst\u00e1lalo y vuelve a iniciar MyRecorder.")
+        raise HTTPException(500, "No se encontro FFmpeg. Instalalo y vuelve a iniciar MyRecorder.")
     resolved = _resolve(body.url.strip())
     rec_id = str(uuid.uuid4())
     title = re.sub(r"[^\w .()-]+", "", resolved["title"]).strip()[:90].rstrip(" .") or "Live"
     folder = OUTPUT / f"{time.strftime('%Y%m%d-%H%M%S')}_{title}"
     folder.mkdir(parents=True, exist_ok=False)
     target = folder / f"{title}.mkv"
-    proc = None
+    row = {"id": rec_id, "title": resolved["title"], "url": body.url.strip(),
+           "file": str(target), "folder": str(folder), "status": "grabando",
+           "created_at": time.time(), "capture_started_at": None,
+           "capture_base_seconds": 0, "elapsed_seconds": 0, "segments": [],
+           "reconnections": 0, "reconnect_attempts": 0}
     try:
-        debug_info = {"kind": resolved["kind"], "formats": resolved.get("debug", [])}
-        (folder / "formats.txt").write_text(json.dumps(debug_info, ensure_ascii=False, indent=2),
-                                              encoding="utf-8")
-        args = _build_ffmpeg_args(resolved, target)
-        args[0] = ffmpeg
-        with (folder / "ffmpeg.log").open("wb") as log_file:
-            proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log_file,
-                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        started_at = time.time()
-        row = {"id": rec_id, "title": resolved["title"], "url": body.url.strip(),
-               "file": str(target), "folder": str(folder), "status": "grabando",
-               "created_at": started_at, "capture_started_at": None,
-               "capture_base_seconds": 0, "elapsed_seconds": 0, "pid": proc.pid,
-               "format_kind": resolved["kind"]}
         with LOCK:
             rows = _read()
             rows.append(row)
             _write(rows)
-        PROCESSES[rec_id] = proc
-        threading.Thread(target=_watch_progress, args=(rec_id, proc), daemon=True).start()
-        threading.Thread(target=_verify_audio_after_start, args=(rec_id, target), daemon=True).start()
-        return _clean(row)
+        with _control_lock(rec_id):
+            current = _start_segment(rec_id, resolved)
+        threading.Thread(target=_verify_audio_after_start,
+                         args=(rec_id, current["file"]), daemon=True).start()
+        return _clean(_get(rec_id))
     except Exception as exc:
-        if proc is not None:
+        proc = PROCESSES.pop(rec_id, None)
+        if isinstance(proc, subprocess.Popen):
             try:
                 proc.terminate()
                 proc.wait(timeout=5)
@@ -416,121 +578,166 @@ def start(body: StartRequest):
                     proc.kill()
                 except OSError:
                     pass
+        with LOCK:
+            _write([item for item in _read() if item.get("id") != rec_id])
         shutil.rmtree(folder, ignore_errors=True)
         if isinstance(exc, HTTPException):
             raise
-        raise HTTPException(500, f"No se pudo iniciar la grabaci\u00f3n: {str(exc)[:200]}") from exc
+        raise HTTPException(500, f"No se pudo iniciar la grabacion: {str(exc)[:200]}") from exc
 
 
 @app.post("/api/recordings/{rec_id}/pause")
 def pause(rec_id: str):
-    row = _get(rec_id)
-    if row["status"] != "grabando":
-        raise HTTPException(409, "La grabaci\u00f3n no est\u00e1 activa.")
+    with LOCK:
+        PAUSING.add(rec_id)
     try:
-        psutil.Process(int(row["pid"])).suspend()
-    except psutil.Error as exc:
-        raise HTTPException(409, f"No se pudo pausar: {exc}") from exc
-    now = time.time()
-    base = float(row.get("capture_base_seconds", row.get("elapsed_seconds", 0)))
-    started = row.get("capture_started_at")
-    elapsed = max(float(row.get("elapsed_seconds", 0)), base + (max(0, now - started) if started else 0))
-    return _clean(_update(rec_id, status="pausada", paused_at=now, elapsed_seconds=elapsed,
-                          capture_base_seconds=elapsed, capture_started_at=None))
+        with _control_lock(rec_id):
+            row = _get(rec_id)
+            if row.get("status") not in {"grabando", "reconectando"}:
+                raise HTTPException(409, "La grabacion no esta activa.")
+            folder = Path(row["folder"])
+            segment = (folder / row["current_segment"] if row.get("current_segment") else
+                       (Path(row["file"]) if not row.get("segments") else None))
+            proc = PROCESSES.get(rec_id)
+            forced = False
+            if isinstance(proc, subprocess.Popen):
+                try:
+                    if proc.poll() is None:
+                        if proc.stdin is None:
+                            raise OSError("FFmpeg no acepta el comando de cierre")
+                        proc.stdin.write(b"q\n")
+                        proc.stdin.flush()
+                        proc.wait(timeout=12)
+                except (OSError, subprocess.TimeoutExpired):
+                    forced = True
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+            elif row.get("pid") and (row.get("current_segment") or not row.get("segments")):
+                try:
+                    orphan = psutil.Process(int(row["pid"]))
+                    orphan.terminate()
+                    try:
+                        orphan.wait(timeout=5)
+                    except psutil.TimeoutExpired:
+                        forced = True
+                        orphan.kill()
+                        try:
+                            orphan.wait(timeout=5)
+                        except psutil.TimeoutExpired:
+                            pass
+                    forced = True
+                except psutil.NoSuchProcess:
+                    forced = bool(segment)
+                except psutil.Error:
+                    forced = True
+            if forced and segment:
+                _repair_mkv(segment)
+            segments = list(row.get("segments") or [])
+            if not segments:
+                old_file = Path(row["file"])
+                first_part = folder / "part01.mkv"
+                if old_file.is_file() and old_file != first_part:
+                    os.replace(old_file, first_part)
+                segments = [first_part.name]
+            now = time.time()
+            started = row.get("capture_started_at")
+            base = float(row.get("capture_base_seconds", row.get("elapsed_seconds", 0)))
+            elapsed = max(float(row.get("elapsed_seconds", 0)),
+                          base + (max(0, now - started) if started else 0))
+            updated = _update(rec_id, status="pausada", paused_at=now, elapsed_seconds=elapsed,
+                              capture_base_seconds=elapsed, capture_started_at=None,
+                              segments=segments, current_segment=None)
+            if PROCESSES.get(rec_id) is proc:
+                PROCESSES.pop(rec_id, None)
+            return _clean(updated)
+    finally:
+        with LOCK:
+            PAUSING.discard(rec_id)
 
 
 @app.post("/api/recordings/{rec_id}/resume")
 def resume(rec_id: str):
-    row = _get(rec_id)
-    if row["status"] != "pausada":
-        raise HTTPException(409, "La grabaci\u00f3n no est\u00e1 pausada.")
-    try:
-        psutil.Process(int(row["pid"])).resume()
-    except psutil.Error as exc:
-        raise HTTPException(409, f"No se pudo reanudar: {exc}") from exc
-    return _clean(_update(rec_id, status="grabando", paused_at=None, capture_started_at=None,
-                          capture_base_seconds=float(row.get("elapsed_seconds", 0))))
+    with _control_lock(rec_id):
+        row = _get(rec_id)
+        if row.get("status") != "pausada":
+            raise HTTPException(409, "La grabacion no esta pausada.")
+        with LOCK:
+            if rec_id in STOPPING:
+                raise HTTPException(409, "La grabacion se esta deteniendo.")
+        resolved = _resolve(row["url"])
+        return _clean(_start_segment(rec_id, resolved))
 
 
 @app.post("/api/recordings/{rec_id}/stop")
 def stop(rec_id: str):
-    row = _get(rec_id)
-    elapsed = float(row.get("elapsed_seconds", 0))
-    if row["status"] == "grabando" and row.get("capture_started_at"):
-        elapsed = max(elapsed, float(row.get("capture_base_seconds", elapsed)
-                                      + max(0, time.time() - row["capture_started_at"])))
-    pid = int(row.get("pid", 0))
-    forced = False
     with LOCK:
         STOPPING.add(rec_id)
-    proc = PROCESSES.get(rec_id)
     try:
-        if isinstance(proc, subprocess.Popen):
-            if row["status"] == "pausada":
-                _resume_pid(pid)
-            try:
-                if proc.stdin is None:
-                    raise OSError("No se puede enviar el comando de cierre a FFmpeg")
-                proc.stdin.write(b"q\n")
-                proc.stdin.flush()
-                proc.wait(timeout=12)
-            except (OSError, subprocess.TimeoutExpired):
-                forced = True
+        with _control_lock(rec_id):
+            row = _get(rec_id)
+            if row.get("status") in {"finalizada", "error"}:
+                return _clean(row)
+            proc = PROCESSES.get(rec_id)
+            forced = False
+            if isinstance(proc, subprocess.Popen):
                 try:
-                    proc.kill()
-                    proc.wait(timeout=5)
+                    if proc.poll() is None:
+                        if proc.stdin is None:
+                            raise OSError("FFmpeg no acepta el comando de cierre")
+                        proc.stdin.write(b"q\n")
+                        proc.stdin.flush()
+                        proc.wait(timeout=12)
                 except (OSError, subprocess.TimeoutExpired):
-                    pass
-        else:
-            try:
-                orphan = psutil.Process(pid)
-                if row["status"] == "pausada":
-                    orphan.resume()
-                orphan.terminate()
-                try:
-                    orphan.wait(timeout=5)
-                except psutil.TimeoutExpired:
                     forced = True
-                    orphan.kill()
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+            elif row.get("pid") and (row.get("current_segment") or not row.get("segments")):
+                try:
+                    orphan = psutil.Process(int(row["pid"]))
+                    if row.get("status") == "pausada":
+                        orphan.resume()
+                    orphan.terminate()
                     try:
                         orphan.wait(timeout=5)
                     except psutil.TimeoutExpired:
-                        pass
-                forced = True
-            except psutil.NoSuchProcess:
-                pass
-            except psutil.Error:
-                forced = True
-                try:
-                    psutil.Process(pid).kill()
+                        forced = True
+                        orphan.kill()
+                        try:
+                            orphan.wait(timeout=5)
+                        except psutil.TimeoutExpired:
+                            pass
+                    forced = True
                 except psutil.NoSuchProcess:
-                    pass
+                    forced = bool(row.get("current_segment") or not row.get("segments"))
                 except psutil.Error:
-                    pass
-        if forced:
-            _repair_mkv(row["file"])
+                    forced = True
+            segment_path = None
+            if row.get("current_segment"):
+                segment_path = Path(row["folder"]) / row["current_segment"]
+            elif not row.get("segments"):
+                segment_path = Path(row["file"])
+            if forced and segment_path:
+                _repair_mkv(segment_path)
+            now = time.time()
+            started = row.get("capture_started_at")
+            base = float(row.get("capture_base_seconds", row.get("elapsed_seconds", 0)))
+            elapsed = max(float(row.get("elapsed_seconds", 0)),
+                          base + (max(0, now - started) if started else 0))
+            _update(rec_id, status="deteniendo", elapsed_seconds=elapsed,
+                    capture_started_at=None, current_segment=None)
+            if PROCESSES.get(rec_id) is proc:
+                PROCESSES.pop(rec_id, None)
+            updated = _finish_recording(rec_id)
+            return _clean(updated)
     finally:
-        PROCESSES.pop(rec_id, None)
-        if not isinstance(proc, subprocess.Popen):
-            with LOCK:
-                STOPPING.discard(rec_id)
-    updated = _update(rec_id, status="finalizada", ended_at=time.time(), elapsed_seconds=elapsed,
-                      capture_started_at=None)
-    _save_audio_check(rec_id, updated["file"])
-    updated = _get(rec_id)
-    cover = _make_cover(updated)
-    if cover:
-        updated = _update(rec_id, cover_file=cover)
-    if isinstance(proc, subprocess.Popen):
-        # The watcher removes this marker after it consumes FFmpeg's EOF.
-        for _ in range(20):
-            with LOCK:
-                if rec_id not in STOPPING:
-                    break
-            time.sleep(0.05)
         with LOCK:
             STOPPING.discard(rec_id)
-    return _clean(updated)
 
 
 @app.post("/api/recordings/{rec_id}/folder")
