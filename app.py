@@ -253,30 +253,71 @@ def _update(rec_id: str, **changes) -> dict:
     raise HTTPException(404, "Grabación no encontrada.")
 
 
+
+def _get(rec_id: str) -> dict:
+    with LOCK:
+        row = next((item for item in _read() if item.get("id") == rec_id), None)
+    if row is None:
+        raise HTTPException(404, "Grabaci?n no encontrada.")
+    return row
+
+
+def _resume_pid(pid: int | str) -> bool:
+    try:
+        psutil.Process(int(pid)).resume()
+        return True
+    except psutil.NoSuchProcess:
+        return False
+
+
+def _repair_mkv(file_path: str | Path) -> bool:
+    ffmpeg = shutil.which("ffmpeg")
+    source = Path(file_path)
+    if not ffmpeg or not source.is_file():
+        return False
+    fixed = source.with_name(f"{source.stem}.fixed.mkv")
+    try:
+        subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+                        "-c", "copy", str(fixed)], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=120, check=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if fixed.is_file() and fixed.stat().st_size > 1024:
+            os.replace(fixed, source)
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    fixed.unlink(missing_ok=True)
+    return False
+
+
 class StartRequest(BaseModel):
     url: str
 
 
 @app.get("/api/recordings")
 def recordings():
-    rows = _read()
-    now = time.time()
-    for row in rows:
-        if row.get("status") == "grabando" and row["id"] not in PROCESSES:
+    with LOCK:
+        rows = _read()
+        before = json.dumps(rows, ensure_ascii=False, sort_keys=True)
+        for row in rows:
+            if row.get("status") != "grabando" or row["id"] in PROCESSES:
+                continue
             try:
-                p = psutil.Process(int(row["pid"]))
-                if p.is_running():
-                    PROCESSES[row["id"]] = p
-                else:
-                    row.update(status="finalizada", ended_at=row.get("ended_at") or time.time())
+                process = psutil.Process(int(row["pid"]))
+                alive = process.is_running()
             except (psutil.Error, KeyError, ValueError):
-                row.update(status="finalizada", ended_at=row.get("ended_at") or time.time())
-        if row.get("status") == "grabando" and row.get("capture_started_at") is not None:
-            current = float(row.get("capture_base_seconds", 0)) + max(
-                0, now - float(row["capture_started_at"]))
-            row["elapsed_seconds"] = max(float(row.get("elapsed_seconds", 0)), current)
-    _write(rows)
-    return {"recordings": [_clean(r) for r in sorted(rows, key=lambda x: x.get("created_at", 0), reverse=True)]}
+                alive = False
+            if not alive:
+                media_file = Path(row.get("file", ""))
+                if media_file.is_file() and media_file.stat().st_size > 1024:
+                    row.update(status="finalizada", ended_at=row.get("ended_at") or time.time())
+                else:
+                    row.update(status="error", ended_at=row.get("ended_at") or time.time(),
+                               error="FFmpeg termin? antes de guardar una grabaci?n v?lida.")
+        if json.dumps(rows, ensure_ascii=False, sort_keys=True) != before:
+            _write(rows)
+        visible = sorted(rows, key=lambda x: x.get("created_at", 0), reverse=True)
+    return {"recordings": [_clean(row) for row in visible]}
 
 
 @app.post("/api/recordings", status_code=202)
@@ -332,11 +373,13 @@ def start(body: StartRequest):
 
 @app.post("/api/recordings/{rec_id}/pause")
 def pause(rec_id: str):
-    row = next((r for r in _read() if r["id"] == rec_id), None)
-    if not row: raise HTTPException(404, "Grabación no encontrada.")
-    if row["status"] != "grabando": raise HTTPException(409, "La grabación no está activa.")
-    try: psutil.Process(int(row["pid"])).suspend()
-    except psutil.Error as exc: raise HTTPException(409, f"No se pudo pausar: {exc}") from exc
+    row = _get(rec_id)
+    if row["status"] != "grabando":
+        raise HTTPException(409, "La grabaci?n no est? activa.")
+    try:
+        psutil.Process(int(row["pid"])).suspend()
+    except psutil.Error as exc:
+        raise HTTPException(409, f"No se pudo pausar: {exc}") from exc
     now = time.time()
     base = float(row.get("capture_base_seconds", row.get("elapsed_seconds", 0)))
     started = row.get("capture_started_at")
@@ -347,47 +390,101 @@ def pause(rec_id: str):
 
 @app.post("/api/recordings/{rec_id}/resume")
 def resume(rec_id: str):
-    row = next((r for r in _read() if r["id"] == rec_id), None)
-    if not row: raise HTTPException(404, "Grabación no encontrada.")
-    if row["status"] != "pausada": raise HTTPException(409, "La grabación no está pausada.")
-    try: psutil.Process(int(row["pid"])).resume()
-    except psutil.Error as exc: raise HTTPException(409, f"No se pudo reanudar: {exc}") from exc
+    row = _get(rec_id)
+    if row["status"] != "pausada":
+        raise HTTPException(409, "La grabaci?n no est? pausada.")
+    try:
+        psutil.Process(int(row["pid"])).resume()
+    except psutil.Error as exc:
+        raise HTTPException(409, f"No se pudo reanudar: {exc}") from exc
     return _clean(_update(rec_id, status="grabando", paused_at=None, capture_started_at=None,
                           capture_base_seconds=float(row.get("elapsed_seconds", 0))))
 
 
 @app.post("/api/recordings/{rec_id}/stop")
 def stop(rec_id: str):
-    row = next((r for r in _read() if r["id"] == rec_id), None)
-    if not row: raise HTTPException(404, "Grabación no encontrada.")
+    row = _get(rec_id)
     elapsed = float(row.get("elapsed_seconds", 0))
     if row["status"] == "grabando" and row.get("capture_started_at"):
         elapsed = max(elapsed, float(row.get("capture_base_seconds", elapsed)
                                       + max(0, time.time() - row["capture_started_at"])))
+    pid = int(row.get("pid", 0))
+    forced = False
+    with LOCK:
+        STOPPING.add(rec_id)
+    proc = PROCESSES.get(rec_id)
     try:
-        proc = PROCESSES.get(rec_id)
-        if proc and proc.stdin:
-            if row["status"] == "pausada": psutil.Process(int(row["pid"])).resume()
-            proc.stdin.write(b"q\n"); proc.stdin.flush()
-            proc.wait(timeout=12)
+        if isinstance(proc, subprocess.Popen):
+            if row["status"] == "pausada":
+                _resume_pid(pid)
+            try:
+                if proc.stdin is None:
+                    raise OSError("No se puede enviar el comando de cierre a FFmpeg")
+                proc.stdin.write(b"q\n")
+                proc.stdin.flush()
+                proc.wait(timeout=12)
+            except (OSError, subprocess.TimeoutExpired):
+                forced = True
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         else:
-            psutil.Process(int(row["pid"])).terminate()
-    except (psutil.Error, subprocess.TimeoutExpired, OSError):
-        try: psutil.Process(int(row["pid"])).kill()
-        except psutil.Error: pass
-    PROCESSES.pop(rec_id, None)
+            try:
+                orphan = psutil.Process(pid)
+                if row["status"] == "pausada":
+                    orphan.resume()
+                orphan.terminate()
+                try:
+                    orphan.wait(timeout=5)
+                except psutil.TimeoutExpired:
+                    forced = True
+                    orphan.kill()
+                    try:
+                        orphan.wait(timeout=5)
+                    except psutil.TimeoutExpired:
+                        pass
+                forced = True
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.Error:
+                forced = True
+                try:
+                    psutil.Process(pid).kill()
+                except psutil.NoSuchProcess:
+                    pass
+                except psutil.Error:
+                    pass
+        if forced:
+            _repair_mkv(row["file"])
+    finally:
+        PROCESSES.pop(rec_id, None)
+        if not isinstance(proc, subprocess.Popen):
+            with LOCK:
+                STOPPING.discard(rec_id)
     updated = _update(rec_id, status="finalizada", ended_at=time.time(), elapsed_seconds=elapsed,
                       capture_started_at=None)
+    _save_audio_check(rec_id, updated["file"])
+    updated = _get(rec_id)
     cover = _make_cover(updated)
     if cover:
         updated = _update(rec_id, cover_file=cover)
+    if isinstance(proc, subprocess.Popen):
+        # The watcher removes this marker after it consumes FFmpeg's EOF.
+        for _ in range(20):
+            with LOCK:
+                if rec_id not in STOPPING:
+                    break
+            time.sleep(0.05)
+        with LOCK:
+            STOPPING.discard(rec_id)
     return _clean(updated)
 
 
 @app.post("/api/recordings/{rec_id}/folder")
 def open_folder(rec_id: str):
-    row = next((r for r in _read() if r["id"] == rec_id), None)
-    if not row: raise HTTPException(404, "Grabación no encontrada.")
+    row = _get(rec_id)
     os.startfile(row["folder"])
     return {"ok": True}
 
