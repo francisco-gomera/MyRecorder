@@ -141,6 +141,16 @@ def _save_audio_check(rec_id: str, file_path: str | Path) -> bool | None:
     return has_audio
 
 
+def _ffmpeg_error_tail(folder: str | Path) -> str:
+    log_path = Path(folder) / "ffmpeg.log"
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
+    except OSError:
+        lines = []
+    message = "\n".join(lines).strip() or "FFmpeg terminó inesperadamente sin dejar detalles en el registro."
+    return message[-400:]
+
+
 def _verify_audio_after_start(rec_id: str, file_path: str | Path) -> None:
     while True:
         with LOCK:
@@ -159,31 +169,59 @@ def _verify_audio_after_start(rec_id: str, file_path: str | Path) -> None:
 
 
 def _watch_progress(rec_id: str, proc: subprocess.Popen) -> None:
-    """Start elapsed time only when FFmpeg reports real media timestamps."""
+    """Track capture time and settle recording state when FFmpeg exits."""
     if proc.stdout is None:
         return
-    for raw in proc.stdout:
-        line = raw.decode("utf-8", errors="replace").strip()
-        if not line.startswith("out_time_us="):
-            continue
-        try:
-            media_time = int(line.partition("=")[2]) / 1_000_000
-        except ValueError:
-            continue
-        if media_time <= 0:
-            continue
-        now = time.time()
-        with LOCK:
-            rows = _read()
-            row = next((item for item in rows if item["id"] == rec_id), None)
-            if not row or row.get("status") != "grabando":
+    try:
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("out_time_us="):
                 continue
-            if row.get("capture_started_at") is None:
-                row["capture_started_at"] = now
-                row["capture_base_seconds"] = float(row.get("elapsed_seconds", 0))
-            row["elapsed_seconds"] = max(float(row.get("elapsed_seconds", 0)), float(
-                row.get("capture_base_seconds", 0) + max(0, now - row["capture_started_at"])))
-            _write(rows)
+            try:
+                media_time = int(line.partition("=")[2]) / 1_000_000
+            except ValueError:
+                continue
+            if media_time <= 0:
+                continue
+            now = time.time()
+            with LOCK:
+                rows = _read()
+                row = next((item for item in rows if item["id"] == rec_id), None)
+                if not row or row.get("status") != "grabando":
+                    continue
+                if row.get("capture_started_at") is None:
+                    row["capture_started_at"] = now
+                    row["capture_base_seconds"] = float(row.get("elapsed_seconds", 0))
+                row["elapsed_seconds"] = max(float(row.get("elapsed_seconds", 0)), float(
+                    row.get("capture_base_seconds", 0) + max(0, now - row["capture_started_at"])))
+                _write(rows)
+    except OSError:
+        pass
+    try:
+        return_code = proc.wait()
+    except (OSError, subprocess.SubprocessError):
+        return_code = proc.poll() if proc.poll() is not None else -1
+    with LOCK:
+        user_stopped = rec_id in STOPPING
+        if user_stopped:
+            STOPPING.discard(rec_id)
+        rows = _read()
+        row = next((item for item in rows if item.get("id") == rec_id), None)
+    if user_stopped or row is None or row.get("status") not in {"grabando", "pausada"}:
+        return
+    media_file = Path(row.get("file", ""))
+    valid_file = media_file.is_file() and media_file.stat().st_size > 1024
+    if return_code == 0 or valid_file:
+        _update(rec_id, status="finalizada", ended_at=time.time(), capture_started_at=None)
+        _save_audio_check(rec_id, media_file)
+        updated = _get(rec_id)
+        cover_path = _make_cover(updated)
+        if cover_path:
+            _update(rec_id, cover_file=cover_path)
+    else:
+        _update(rec_id, status="error", ended_at=time.time(), capture_started_at=None,
+                error=_ffmpeg_error_tail(row.get("folder", "")))
+    PROCESSES.pop(rec_id, None)
 
 
 def _make_cover(row: dict) -> str | None:
@@ -258,7 +296,7 @@ def _get(rec_id: str) -> dict:
     with LOCK:
         row = next((item for item in _read() if item.get("id") == rec_id), None)
     if row is None:
-        raise HTTPException(404, "Grabaci?n no encontrada.")
+        raise HTTPException(404, "Grabaci\u00f3n no encontrada.")
     return row
 
 
@@ -266,7 +304,7 @@ def _resume_pid(pid: int | str) -> bool:
     try:
         psutil.Process(int(pid)).resume()
         return True
-    except psutil.NoSuchProcess:
+    except psutil.Error:
         return False
 
 
@@ -296,6 +334,7 @@ class StartRequest(BaseModel):
 
 @app.get("/api/recordings")
 def recordings():
+    completed = []
     with LOCK:
         rows = _read()
         before = json.dumps(rows, ensure_ascii=False, sort_keys=True)
@@ -303,20 +342,32 @@ def recordings():
             if row.get("status") != "grabando" or row["id"] in PROCESSES:
                 continue
             try:
-                process = psutil.Process(int(row["pid"]))
-                alive = process.is_running()
+                alive = psutil.Process(int(row["pid"])).is_running()
             except (psutil.Error, KeyError, ValueError):
                 alive = False
             if not alive:
                 media_file = Path(row.get("file", ""))
                 if media_file.is_file() and media_file.stat().st_size > 1024:
-                    row.update(status="finalizada", ended_at=row.get("ended_at") or time.time())
+                    row.update(status="finalizada", ended_at=row.get("ended_at") or time.time(),
+                               capture_started_at=None)
+                    completed.append((row["id"], True))
                 else:
                     row.update(status="error", ended_at=row.get("ended_at") or time.time(),
-                               error="FFmpeg termin? antes de guardar una grabaci?n v?lida.")
+                               capture_started_at=None, error=_ffmpeg_error_tail(row.get("folder", "")))
+                    completed.append((row["id"], False))
         if json.dumps(rows, ensure_ascii=False, sort_keys=True) != before:
             _write(rows)
-        visible = sorted(rows, key=lambda x: x.get("created_at", 0), reverse=True)
+    for rec_id, valid in completed:
+        if not valid:
+            continue
+        row = _get(rec_id)
+        _save_audio_check(rec_id, row["file"])
+        row = _get(rec_id)
+        cover_path = _make_cover(row)
+        if cover_path:
+            _update(rec_id, cover_file=cover_path)
+    with LOCK:
+        visible = sorted(_read(), key=lambda x: x.get("created_at", 0), reverse=True)
     return {"recordings": [_clean(row) for row in visible]}
 
 
@@ -324,7 +375,7 @@ def recordings():
 def start(body: StartRequest):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        raise HTTPException(500, "No se encontr? FFmpeg. Inst?lalo y vuelve a iniciar MyRecorder.")
+        raise HTTPException(500, "No se encontr\u00f3 FFmpeg. Inst\u00e1lalo y vuelve a iniciar MyRecorder.")
     resolved = _resolve(body.url.strip())
     rec_id = str(uuid.uuid4())
     title = re.sub(r"[^\w .()-]+", "", resolved["title"]).strip()[:90].rstrip(" .") or "Live"
@@ -368,14 +419,14 @@ def start(body: StartRequest):
         shutil.rmtree(folder, ignore_errors=True)
         if isinstance(exc, HTTPException):
             raise
-        raise HTTPException(500, f"No se pudo iniciar la grabaci?n: {str(exc)[:200]}") from exc
+        raise HTTPException(500, f"No se pudo iniciar la grabaci\u00f3n: {str(exc)[:200]}") from exc
 
 
 @app.post("/api/recordings/{rec_id}/pause")
 def pause(rec_id: str):
     row = _get(rec_id)
     if row["status"] != "grabando":
-        raise HTTPException(409, "La grabaci?n no est? activa.")
+        raise HTTPException(409, "La grabaci\u00f3n no est\u00e1 activa.")
     try:
         psutil.Process(int(row["pid"])).suspend()
     except psutil.Error as exc:
@@ -392,7 +443,7 @@ def pause(rec_id: str):
 def resume(rec_id: str):
     row = _get(rec_id)
     if row["status"] != "pausada":
-        raise HTTPException(409, "La grabaci?n no est? pausada.")
+        raise HTTPException(409, "La grabaci\u00f3n no est\u00e1 pausada.")
     try:
         psutil.Process(int(row["pid"])).resume()
     except psutil.Error as exc:
@@ -425,10 +476,10 @@ def stop(rec_id: str):
                 proc.wait(timeout=12)
             except (OSError, subprocess.TimeoutExpired):
                 forced = True
-                proc.kill()
                 try:
+                    proc.kill()
                     proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
+                except (OSError, subprocess.TimeoutExpired):
                     pass
         else:
             try:

@@ -62,5 +62,7 @@ def test_ffmpeg_args_put_reconnect_before_each_input(kind, expected_maps, input_
     reconnects = [index for index, value in enumerate(args) if value == "-reconnect"]
     assert len(inputs) == input_count
     assert len(reconnects) == input_count
-    assert all(any(reconnect < input_index for reconnect in reconnects) for input_index in inputs)
+    for position, input_index in enumerate(inputs):
+        lower_bound = inputs[position - 1] if position else -1
+        assert any(lower_bound < reconnect < input_index for reconnect in reconnects)
     assert [args[index + 1] for index, value in enumerate(args) if value == "-map"] == expected_maps
