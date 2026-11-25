@@ -536,7 +536,15 @@ def stop(rec_id: str):
 @app.post("/api/recordings/{rec_id}/folder")
 def open_folder(rec_id: str):
     row = _get(rec_id)
-    os.startfile(row["folder"])
+    try:
+        if sys.platform == "win32":
+            os.startfile(row["folder"])
+        elif sys.platform == "darwin":
+            subprocess.run(["open", row["folder"]], check=False)
+        else:
+            subprocess.run(["xdg-open", row["folder"]], check=False)
+    except OSError as exc:
+        raise HTTPException(500, f"No se pudo abrir la carpeta: {exc}") from exc
     return {"ok": True}
 
 
