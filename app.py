@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -24,6 +25,7 @@ STATE = OUTPUT / "recordings.json"
 OUTPUT.mkdir(parents=True, exist_ok=True)
 LOCK = threading.RLock()
 PROCESSES: dict[str, subprocess.Popen] = {}
+STOPPING: set[str] = set()
 app = FastAPI(title="MyRecorder")
 
 
@@ -53,6 +55,107 @@ def _headers_arg(headers: dict) -> list[str]:
         return []
     value = "".join(f"{key}: {item}\r\n" for key, item in headers.items())
     return ["-headers", value]
+
+
+def _format_debug(fmt: dict) -> dict:
+    """Keep useful format metadata while deliberately excluding expiring URLs."""
+    return {key: fmt.get(key) for key in
+            ("format_id", "protocol", "vcodec", "acodec", "height", "ext")}
+
+
+def _pick_formats(formats: list[dict]) -> dict:
+    available = [f for f in formats if isinstance(f, dict) and f.get("url")]
+    muxed = [f for f in available if f.get("vcodec") not in (None, "none")
+             and f.get("acodec") not in (None, "none")]
+    if muxed:
+        chosen = max(muxed, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
+        return {"kind": "muxed", "media_url": chosen["url"], "audio_url": None,
+                "headers": chosen.get("http_headers") or {}, "audio_headers": {},
+                "debug": [_format_debug(chosen)]}
+
+    videos = [f for f in available if f.get("vcodec") not in (None, "none")
+              and f.get("acodec") == "none"]
+    audios = [f for f in available if f.get("acodec") not in (None, "none")
+              and f.get("vcodec") in (None, "none")]
+    if videos and audios:
+        video = max(videos, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
+        audio = max(audios, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0))
+        return {"kind": "pair", "media_url": video["url"], "audio_url": audio["url"],
+                "headers": video.get("http_headers") or {},
+                "audio_headers": audio.get("http_headers") or {},
+                "debug": [_format_debug(video), _format_debug(audio)]}
+
+    unknown = [f for f in available if f.get("vcodec") is None or f.get("acodec") is None]
+    if unknown:
+        chosen = max(unknown, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
+        return {"kind": "unknown", "media_url": chosen["url"], "audio_url": None,
+                "headers": chosen.get("http_headers") or {}, "audio_headers": {},
+                "debug": [_format_debug(chosen)]}
+    raise ValueError("YouTube no ofreció formatos de video compatibles.")
+
+
+def _build_ffmpeg_args(resolved: dict, target: str | Path) -> list[str]:
+    args = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-stats_period", "0.5",
+            "-progress", "pipe:1"]
+    reconnect = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+    if resolved["kind"] == "pair":
+        args += ["-thread_queue_size", "1024", *reconnect,
+                 *_headers_arg(resolved.get("headers") or {}), "-i", resolved["media_url"],
+                 "-thread_queue_size", "1024", *reconnect,
+                 *_headers_arg(resolved.get("audio_headers") or {}), "-i", resolved["audio_url"],
+                 "-map", "0:v:0", "-map", "1:a:0"]
+    else:
+        args += [*reconnect, *_headers_arg(resolved.get("headers") or {}), "-i", resolved["media_url"]]
+        if resolved["kind"] == "muxed":
+            args += ["-map", "0:v:0", "-map", "0:a:0"]
+        else:
+            args += ["-map", "0:v:0?", "-map", "0:a:0?"]
+    args += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+             "-af", "aresample=async=1:first_pts=0", "-f", "matroska", str(target)]
+    return args
+
+
+def _has_audio(path: str | Path) -> bool | None:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a",
+                                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)],
+                                capture_output=True, text=True, timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
+def _save_audio_check(rec_id: str, file_path: str | Path) -> bool | None:
+    has_audio = _has_audio(file_path)
+    if has_audio is False:
+        _update(rec_id, has_audio=False,
+                warning="La grabación no tiene pista de audio. Revisa ffmpeg.log y formats.txt.")
+    elif has_audio is True:
+        _update(rec_id, has_audio=True)
+    return has_audio
+
+
+def _verify_audio_after_start(rec_id: str, file_path: str | Path) -> None:
+    while True:
+        with LOCK:
+            rows = _read()
+            row = next((item for item in rows if item["id"] == rec_id), None)
+            if not row or row.get("status") not in {"grabando", "pausada"}:
+                return
+            started_at = row.get("capture_started_at")
+        if started_at is not None:
+            break
+        time.sleep(0.5)
+    delay = max(0, float(started_at) + 20 - time.time())
+    if delay:
+        time.sleep(delay)
+    _save_audio_check(rec_id, file_path)
 
 
 def _watch_progress(rec_id: str, proc: subprocess.Popen) -> None:
@@ -120,36 +223,19 @@ def _resolve(url: str) -> dict:
             info = ydl.extract_info(url, download=False)
         if not info.get("is_live") and info.get("live_status") != "is_live":
             raise HTTPException(400, "El enlace no corresponde a un live activo.")
-        formats = [f for f in info.get("formats", []) if f.get("url")]
-        videos = [f for f in formats if f.get("vcodec") not in (None, "none")]
-        audios = [f for f in formats if f.get("acodec") not in (None, "none")]
-        video_only = [f for f in videos if f.get("acodec") in (None, "none")]
-        audio_only = [f for f in audios if f.get("vcodec") in (None, "none")]
-        video_candidates = video_only or videos
-        audio_candidates = audio_only or audios
-        video = max(video_candidates, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0)) if video_candidates else None
-        audio = max(audio_candidates, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0)) if audio_candidates else None
-        # Prefer an explicit video+audio pair whenever YouTube exposes adaptive
-        # streams. A muxed format can be an incomplete live rendition on some
-        # manifests even though yt-dlp lists it as carrying audio.
-        if video and audio and audio["url"] != video["url"]:
-            return {"title": info.get("title") or "Live de YouTube", "media_url": video["url"],
-                    "audio_url": audio["url"],
-                    "headers": video.get("http_headers") or info.get("http_headers") or {},
-                    "audio_headers": audio.get("http_headers") or info.get("http_headers") or {}}
-        combined = [f for f in formats if f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")]
-        if combined:
-            selected = max(combined, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
-            return {"title": info.get("title") or "Live de YouTube", "media_url": selected["url"],
-                    "headers": selected.get("http_headers") or info.get("http_headers") or {}}
-        if not video:
-            if info.get("url"):
-                return {"title": info.get("title") or "Live de YouTube", "media_url": info["url"], "headers": info.get("http_headers") or {}}
-            raise HTTPException(400, "YouTube no ofreció un stream compatible.")
-        return {"title": info.get("title") or "Live de YouTube", "media_url": video["url"],
-                "audio_url": audio["url"] if audio and audio["url"] != video["url"] else None,
-                "headers": video.get("http_headers") or info.get("http_headers") or {},
-                "audio_headers": (audio.get("http_headers") or info.get("http_headers") or {}) if audio else {}}
+        try:
+            selected = _pick_formats(info.get("formats", []))
+        except ValueError:
+            if not info.get("url"):
+                raise
+            selected = {"kind": "unknown", "media_url": info["url"], "audio_url": None,
+                        "headers": info.get("http_headers") or {}, "audio_headers": {},
+                        "debug": [{"format_id": info.get("format_id"), "protocol": info.get("protocol"),
+                                   "vcodec": info.get("vcodec"), "acodec": info.get("acodec"),
+                                   "height": info.get("height"), "ext": info.get("ext")}]}
+        selected["headers"] = selected.get("headers") or info.get("http_headers") or {}
+        selected["audio_headers"] = selected.get("audio_headers") or info.get("http_headers") or {}
+        return {"title": info.get("title") or "Live de YouTube", **selected}
     except HTTPException:
         raise
     except Exception as exc:
@@ -195,38 +281,53 @@ def recordings():
 
 @app.post("/api/recordings", status_code=202)
 def start(body: StartRequest):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(500, "No se encontr? FFmpeg. Inst?lalo y vuelve a iniciar MyRecorder.")
     resolved = _resolve(body.url.strip())
     rec_id = str(uuid.uuid4())
-    title = re.sub(r"[^\w .()-]+", "", resolved["title"]).strip()[:90] or "Live"
+    title = re.sub(r"[^\w .()-]+", "", resolved["title"]).strip()[:90].rstrip(" .") or "Live"
     folder = OUTPUT / f"{time.strftime('%Y%m%d-%H%M%S')}_{title}"
     folder.mkdir(parents=True, exist_ok=False)
     target = folder / f"{title}.mkv"
-    args = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-stats_period", "0.5",
-            "-progress", "pipe:1", *_headers_arg(resolved.get("headers") or {}), "-i", resolved["media_url"]]
-    if resolved.get("audio_url"):
-        args += [*_headers_arg(resolved.get("audio_headers") or {}), "-i", resolved["audio_url"],
-                 "-map", "0:v:0", "-map", "1:a:0"]
-    else:
-        args += ["-map", "0:v:0?", "-map", "0:a:0?"]
-    # YouTube commonly serves Opus; AAC in the MKV is more widely playable.
-    args += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-f", "matroska", str(target)]
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise HTTPException(500, "No se encontró FFmpeg. Instálalo y vuelve a iniciar MyRecorder.")
-    args[0] = ffmpeg
+    proc = None
     try:
+        debug_info = {"kind": resolved["kind"], "formats": resolved.get("debug", [])}
+        (folder / "formats.txt").write_text(json.dumps(debug_info, ensure_ascii=False, indent=2),
+                                              encoding="utf-8")
+        args = _build_ffmpeg_args(resolved, target)
+        args[0] = ffmpeg
         with (folder / "ffmpeg.log").open("wb") as log_file:
             proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log_file,
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except OSError as exc:
-        raise HTTPException(500, f"No se pudo iniciar FFmpeg: {exc}") from exc
-    started_at = time.time()
-    row = {"id": rec_id, "title": resolved["title"], "url": body.url.strip(), "file": str(target), "folder": str(folder), "status": "grabando", "created_at": started_at, "capture_started_at": None, "capture_base_seconds": 0, "elapsed_seconds": 0, "pid": proc.pid}
-    with LOCK:
-        rows = _read(); rows.append(row); _write(rows)
-    PROCESSES[rec_id] = proc
-    threading.Thread(target=_watch_progress, args=(rec_id, proc), daemon=True).start()
-    return _clean(row)
+        started_at = time.time()
+        row = {"id": rec_id, "title": resolved["title"], "url": body.url.strip(),
+               "file": str(target), "folder": str(folder), "status": "grabando",
+               "created_at": started_at, "capture_started_at": None,
+               "capture_base_seconds": 0, "elapsed_seconds": 0, "pid": proc.pid,
+               "format_kind": resolved["kind"]}
+        with LOCK:
+            rows = _read()
+            rows.append(row)
+            _write(rows)
+        PROCESSES[rec_id] = proc
+        threading.Thread(target=_watch_progress, args=(rec_id, proc), daemon=True).start()
+        threading.Thread(target=_verify_audio_after_start, args=(rec_id, target), daemon=True).start()
+        return _clean(row)
+    except Exception as exc:
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+        shutil.rmtree(folder, ignore_errors=True)
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(500, f"No se pudo iniciar la grabaci?n: {str(exc)[:200]}") from exc
 
 
 @app.post("/api/recordings/{rec_id}/pause")
