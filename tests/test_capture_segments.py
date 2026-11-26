@@ -46,6 +46,7 @@ def test_pause_resume_creates_parts_and_stop_joins_them(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "_watch_progress", lambda *_args: None)
     monkeypatch.setattr(app, "_verify_audio_after_start", lambda *_args: None)
     monkeypatch.setattr(app, "_has_audio", lambda _path: True)
+    monkeypatch.setattr(app, "_has_video", lambda _path: True)
     monkeypatch.setattr(app, "_make_cover", lambda _row: None)
     monkeypatch.setattr(app.shutil, "which", lambda _name: "ffmpeg.exe")
     app.PROCESSES.clear()
@@ -143,3 +144,17 @@ def test_unexpected_exit_tries_reconnect_at_most_three_times(tmp_path, monkeypat
 
     assert attempts == 3
     assert app._get(rec_id)["status"] == "error"
+
+
+def test_audio_check_reports_missing_video(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "STATE", tmp_path / "recordings.json")
+    monkeypatch.setattr(app, "_has_audio", lambda _path: True)
+    monkeypatch.setattr(app, "_has_video", lambda _path: False)
+    app._write([{"id": "video-check", "status": "finalizada"}])
+
+    app._save_audio_check("video-check", tmp_path / "capture.mkv")
+
+    row = app._get("video-check")
+    assert row["has_audio"] is True
+    assert row["has_video"] is False
+    assert row["warning"] == "La grabaci\u00f3n no tiene pista de video. Revisa formats.txt y ffmpeg.log."

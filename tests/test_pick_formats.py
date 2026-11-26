@@ -41,6 +41,22 @@ def test_selects_unknown_codec_format_as_possible_muxed():
     assert selected["media_url"] == "unknown"
 
 
+def test_audio_only_format_with_unknown_video_codec_is_rejected():
+    with pytest.raises(ValueError, match="formatos de video compatibles"):
+        _pick_formats([
+            {"format_id": "audio", "url": "audio-url", "vcodec": None,
+             "acodec": "opus", "abr": 128},
+        ])
+
+
+def test_unknown_formats_require_video_evidence():
+    with pytest.raises(ValueError, match="formatos de video compatibles"):
+        _pick_formats([
+            {"format_id": "audio", "url": "audio-url", "vcodec": "none",
+             "acodec": None, "abr": 128, "height": 720},
+        ])
+
+
 def test_empty_formats_raise_controlled_error():
     with pytest.raises(ValueError, match="formatos de video compatibles"):
         _pick_formats([])
@@ -51,7 +67,7 @@ def test_empty_formats_raise_controlled_error():
     [
         ("muxed", ["0:v:0", "0:a:0"], 1),
         ("pair", ["0:v:0", "1:a:0"], 2),
-        ("unknown", ["0:v:0?", "0:a:0?"], 1),
+        ("unknown", ["0:v:0", "0:a:0?"], 1),
     ],
 )
 def test_ffmpeg_args_put_reconnect_before_each_input(kind, expected_maps, input_count):

@@ -92,7 +92,10 @@ def _pick_formats(formats: list[dict]) -> dict:
                 "audio_headers": audio.get("http_headers") or {},
                 "debug": [_format_debug(video), _format_debug(audio)]}
 
-    unknown = [f for f in available if f.get("vcodec") is None or f.get("acodec") is None]
+    unknown = [f for f in available
+               if (f.get("vcodec") is None or f.get("acodec") is None)
+               and f.get("vcodec") != "none"
+               and (f.get("height") or f.get("width") or f.get("vcodec"))]
     if unknown:
         chosen = max(unknown, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
         return {"kind": "unknown", "media_url": chosen["url"], "audio_url": None,
@@ -116,7 +119,7 @@ def _build_ffmpeg_args(resolved: dict, target: str | Path) -> list[str]:
         if resolved["kind"] == "muxed":
             args += ["-map", "0:v:0", "-map", "0:a:0"]
         else:
-            args += ["-map", "0:v:0?", "-map", "0:a:0?"]
+            args += ["-map", "0:v:0", "-map", "0:a:0?"]
     args += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ac", "2",
              "-af", "aresample=async=1:first_pts=0", "-f", "matroska", str(target)]
     return args
@@ -138,18 +141,40 @@ def _has_audio(path: str | Path) -> bool | None:
     return bool(result.stdout.strip())
 
 
+def _has_video(path: str | Path) -> bool | None:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v",
+                                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+                                capture_output=True, text=True, timeout=15,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
 def _save_audio_check(rec_id: str, file_path: str | Path) -> bool | None:
     has_audio = _has_audio(file_path)
     audio_warning = "La grabaci\u00f3n no tiene pista de audio. Revisa ffmpeg.log y formats.txt."
-    if has_audio is False:
-        row = _get(rec_id)
-        existing = str(row.get("warning") or "")
-        warning = existing if audio_warning in existing else " ".join(filter(None, (existing, audio_warning)))
-        _update(rec_id, has_audio=False, warning=warning)
-    elif has_audio is True:
-        row = _get(rec_id)
-        existing = str(row.get("warning") or "").replace(audio_warning, "").strip()
-        _update(rec_id, has_audio=True, warning=existing or None)
+    video_warning = "La grabaci\u00f3n no tiene pista de video. Revisa formats.txt y ffmpeg.log."
+    has_video = _has_video(file_path)
+    row = _get(rec_id)
+    warnings = str(row.get("warning") or "")
+    for result, flag, warning in ((has_audio, "has_audio", audio_warning),
+                                  (has_video, "has_video", video_warning)):
+        if result is False:
+            if warning not in warnings:
+                warnings = " ".join(filter(None, (warnings, warning)))
+            row[flag] = False
+        elif result is True:
+            warnings = warnings.replace(warning, "").strip()
+            row[flag] = True
+    _update(rec_id, **{key: row[key] for key in ("has_audio", "has_video") if key in row},
+            warning=warnings or None)
     return has_audio
 
 
@@ -323,8 +348,12 @@ def _resolve(url: str) -> dict:
         try:
             selected = _pick_formats(info.get("formats", []))
         except ValueError:
-            if not info.get("url"):
-                raise
+            if not info.get("url") or info.get("vcodec") == "none":
+                raise HTTPException(
+                    400,
+                    "YouTube no ofreci\u00f3 un stream de video accesible (\u00bffalta runtime de JS o token?). "
+                    "Actualiza yt-dlp con pip install -U yt-dlp e instala un runtime de JavaScript (Deno o Node).",
+                )
             selected = {"kind": "unknown", "media_url": info["url"], "audio_url": None,
                         "headers": info.get("http_headers") or {}, "audio_headers": {},
                         "debug": [{"format_id": info.get("format_id"), "protocol": info.get("protocol"),
