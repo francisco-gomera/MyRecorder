@@ -82,8 +82,9 @@ def _pick_formats(formats: list[dict]) -> dict:
 
     videos = [f for f in available if f.get("vcodec") not in (None, "none")
               and f.get("acodec") == "none"]
-    audios = [f for f in available if f.get("acodec") not in (None, "none")
-              and f.get("vcodec") in (None, "none")]
+    audios = [f for f in available
+              if f.get("vcodec") in (None, "none") and f.get("acodec") != "none"
+              and (f.get("acodec") is not None or f.get("vcodec") == "none")]
     if videos and audios:
         video = max(videos, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
         audio = max(audios, key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0))

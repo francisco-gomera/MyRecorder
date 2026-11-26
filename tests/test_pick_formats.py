@@ -44,6 +44,18 @@ def test_selects_separate_video_and_audio_only_when_no_muxed():
     assert selected["audio_url"] == "audio"
 
 
+def test_selects_video_when_youtube_audio_codec_is_unknown():
+    selected = _pick_formats([
+        {"format_id": "233", "url": "audio", "vcodec": "none", "acodec": None,
+         "protocol": "m3u8_native", "ext": "mp4"},
+        {"format_id": "312", "url": "video", "vcodec": "avc1.64002A", "acodec": "none",
+         "width": 1920, "height": 1080, "tbr": 7172, "protocol": "m3u8_native"},
+    ])
+    assert selected["kind"] == "pair"
+    assert selected["media_url"] == "video"
+    assert selected["audio_url"] == "audio"
+
+
 def test_selects_unknown_codec_format_as_possible_muxed():
     selected = _pick_formats([
         {"format_id": "live", "url": "unknown", "vcodec": "avc1", "acodec": None,
