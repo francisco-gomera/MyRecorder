@@ -7,6 +7,7 @@ Aplicación local para grabar directos de YouTube en un único archivo MKV. Perm
 - Windows 10/11
 - Python 3.10 o posterior
 - FFmpeg y ffprobe disponibles en `PATH` (ffprobe se instala junto con FFmpeg)
+- Deno 2.3 o posterior en `PATH` para que yt-dlp resuelva los desafíos JavaScript de YouTube (recomendado)
 
 ## Instalación y ejecución
 
@@ -18,6 +19,18 @@ python -m uvicorn app:app --host 127.0.0.1 --port 8765
 ```
 
 Abre http://127.0.0.1:8765 en el navegador. Pega la URL de un directo activo para comenzar a grabar.
+
+La dependencia `yt-dlp[default]` incluye los componentes EJS usados para resolver desafíos de YouTube. En Windows puedes instalar Deno con `winget install DenoLand.Deno`; abre una terminal nueva y confirma la instalación con `deno --version`. Después de instalar o actualizar yt-dlp o Deno, reinicia Uvicorn para que la aplicación los detecte.
+
+Para comprobar la extracción fuera de MyRecorder, activa el entorno virtual y ejecuta:
+
+```powershell
+yt-dlp -F "URL_DEL_LIVE"
+```
+
+La lista debe incluir formatos de video con resoluciones. Si solo aparecen formatos de audio o mensajes de desafío JavaScript, actualiza el entorno de la aplicación con `pip install -U "yt-dlp[default]"` y comprueba que Deno esté en el `PATH` de la terminal desde donde inicias Uvicorn.
+
+Como alternativa a Deno, MyRecorder activa Node automáticamente si `node` está en `PATH` y Deno no está disponible. También puedes forzar Node configurando `MYRECORDER_JS_RUNTIME=node` antes de iniciar Uvicorn. Si ambos están instalados, Deno se usa por defecto.
 
 Las grabaciones se guardan por defecto en `recordings` dentro del proyecto. Para usar otra ubicación, define la variable de entorno `MYRECORDER_OUTPUT` antes de iniciar la aplicación.
 

@@ -157,6 +157,16 @@ def _has_video(path: str | Path) -> bool | None:
     return bool(result.stdout.strip())
 
 
+def _youtube_dl_options() -> dict:
+    options = {"quiet": True, "no_warnings": True, "noplaylist": True,
+               "skip_download": True}
+    requested_runtime = os.environ.get("MYRECORDER_JS_RUNTIME", "").strip().lower()
+    if requested_runtime == "node" or (
+            not requested_runtime and not shutil.which("deno") and shutil.which("node")):
+        options["js_runtimes"] = {"node": {}}
+    return options
+
+
 def _save_audio_check(rec_id: str, file_path: str | Path) -> bool | None:
     has_audio = _has_audio(file_path)
     audio_warning = "La grabaci\u00f3n no tiene pista de audio. Revisa ffmpeg.log y formats.txt."
@@ -341,7 +351,9 @@ def _resolve(url: str) -> dict:
         # Do not constrain formats at extraction time: some YouTube live
         # manifests expose only formats outside yt-dlp's generic `best` filter.
         # Inspect the returned formats below and choose a compatible stream.
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}) as ydl:
+        # yt-dlp enables Deno by default. Node is opt-in because explicitly
+        # enabling it changes runtime selection when both are installed.
+        with yt_dlp.YoutubeDL(_youtube_dl_options()) as ydl:
             info = ydl.extract_info(url, download=False)
         if not info.get("is_live") and info.get("live_status") != "is_live":
             raise HTTPException(400, "El enlace no corresponde a un live activo.")

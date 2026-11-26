@@ -1,6 +1,18 @@
 import pytest
 
-from app import _build_ffmpeg_args, _pick_formats
+from app import _build_ffmpeg_args, _pick_formats, _youtube_dl_options
+
+
+def test_yt_dlp_uses_default_runtime_unless_node_is_requested(monkeypatch):
+    monkeypatch.delenv("MYRECORDER_JS_RUNTIME", raising=False)
+    monkeypatch.setattr("app.shutil.which", lambda name: "node.exe" if name == "node" else None)
+    assert _youtube_dl_options()["js_runtimes"] == {"node": {}}
+
+    monkeypatch.setattr("app.shutil.which", lambda name: f"{name}.exe")
+    assert "js_runtimes" not in _youtube_dl_options()
+
+    monkeypatch.setenv("MYRECORDER_JS_RUNTIME", "node")
+    assert _youtube_dl_options()["js_runtimes"] == {"node": {}}
 
 
 def test_prefers_best_muxed_format():
